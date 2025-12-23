@@ -1,0 +1,78 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+.envrc
+
+# Conda
+.conda/
+conda-meta/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+
+# Environment files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Supabase local
+infra/.supabase/
+infra/supabase/.temp/
+infra/supabase/.branches/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Next.js
+.next/
+out/
+
+# Build outputs
+dist/
+build/
+coverage/
+
+# Logs
+*.log
+logs/
+
+# Runtime
+*.pid
+*.sock
+
+# Local test images & generated assets
+test_images/
+uploads/
+storage/
+
+# Device simulator local state
+device_queue.db
+device_queue.sqlite
+device_state.json
+
+#temporary copy files
+*copy).*
+
+
+
+
