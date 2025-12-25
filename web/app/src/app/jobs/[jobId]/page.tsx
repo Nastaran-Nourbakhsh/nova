@@ -35,6 +35,8 @@ type DiamondImage = {
   storage_path: string;
   preview_storage_path: string | null;
   preview_ready: boolean;
+  original_ready: boolean;
+  original_uploaded_at: string | null;
   created_at: string;
 };
 
@@ -260,7 +262,7 @@ export default function JobDetailPage() {
 
         const { data: imageRows, error: imageErr } = await supabase
           .from("diamond_images")
-          .select("id, diamond_id, image_type, storage_path, preview_storage_path, preview_ready, created_at")
+          .select("id, diamond_id, image_type, storage_path, preview_storage_path, preview_ready, original_ready, original_uploaded_at, created_at")
           .in("diamond_id", diamondIds);
 
         if (imageErr) {
@@ -410,6 +412,7 @@ export default function JobDetailPage() {
                                   const uvUrl = uvPreviewPath ? signedUrlByPath[uvPreviewPath] : "";
                                   const asetUrl = asetPreviewPath ? signedUrlByPath[asetPreviewPath] : "";
 
+                                  const originalsComplete = !!uv?.original_ready && !!aset?.original_ready;
 
                                   return (
                                     <tr key={d.id} className="border-t">
@@ -417,6 +420,15 @@ export default function JobDetailPage() {
 
                                       <td className="px-3 py-2 font-mono text-xs">
                                         {d.id}
+                                        {originalsComplete ? (
+                                          <span className="ml-2 text-[11px] rounded-full border px-2 py-0.5 text-green-700">
+                                            Originals uploaded
+                                          </span>
+                                        ) : (
+                                          <span className="ml-2 text-[11px] rounded-full border px-2 py-0.5 text-gray-600">
+                                            Originals pending
+                                          </span>
+                                        )}
                                         <div className="text-[11px] text-gray-500">
                                           captured:{" "}
                                           {d.captured_at
@@ -446,7 +458,7 @@ export default function JobDetailPage() {
 
                                       <td className="px-3 py-2">
                                         <div className="flex items-center gap-3">
-                                          {asetUrl ? (
+                                          {aset?.preview_ready && asetUrl ? (
                                             <img
                                               src={asetUrl}
                                               alt="ASET thumbnail"

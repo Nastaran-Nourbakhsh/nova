@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header, Depends
 from supabase import create_client, Client
 
+import requests
+
 from schemas import (
     JobStartRequest,
     JobStartResponse,
@@ -15,6 +17,7 @@ from schemas import (
     SignedUploadResponse,
     CreateScanRequest,
     ConfirmOriginalsRequest,
+    ConfirmOriginalsResponse,
     SignedDownloadRequest,
 )
 
@@ -58,6 +61,47 @@ def health():
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def storage_object_exists(bucket: str, path: str) -> bool:
+    """
+    Check if an object exists in Supabase Storage using HTTP HEAD.
+    Works with service role key (bypasses RLS/policies).
+    """
+    base = SUPABASE_URL.rstrip("/")  # remove trailing slash if any
+    url = f"{base}/storage/v1/object/{bucket}/{path}"
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    }
+
+    r = requests.head(url, headers=headers, timeout=10)
+    if r.status_code == 200:
+        return True
+    if r.status_code == 404:
+        return False
+
+    # other errors are real problems (permissions, bad url, etc.)
+    raise HTTPException(
+        status_code=502,
+        detail=f"Storage HEAD unexpected status={r.status_code} bucket={bucket} path={path} body={r.text}",
+    )
+
+
+def object_exists_in_storage(bucket: str, object_name: str) -> bool:
+    """
+    Verifies existence by querying Postgres: storage.objects
+    This is reliable and does NOT require downloading the file.
+    """
+    res = (
+        supabase.schema("storage")
+        .table("objects")
+        .select("id")
+        .eq("bucket_id", bucket)
+        .eq("name", object_name)
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
 
 def get_org_id_by_slug(org_slug: str) -> str:
     org_res = supabase.table("orgs").select("id").eq("slug", org_slug).execute()
@@ -309,46 +353,107 @@ def ingest_scan(payload: CreateScanRequest):
 # ----------------------------
 # Confirm originals uploaded later
 # ----------------------------
-@app.post("/ingest/confirm-originals", dependencies=[Depends(require_device_key)])
+@app.post(
+    "/ingest/confirm-originals",
+    response_model=ConfirmOriginalsResponse,
+    dependencies=[Depends(require_device_key)],
+)
 def confirm_originals(payload: ConfirmOriginalsRequest):
-    org_id = get_org_id_by_slug(payload.org_slug)
-    _job = ensure_job_exists(payload.job_id, org_id)
+    # 1) Find org
+    org_res = supabase.table("orgs").select("id").eq("slug", payload.org_slug).execute()
+    if not org_res.data:
+        raise HTTPException(status_code=404, detail=f"org_slug '{payload.org_slug}' not found")
+    org_id = org_res.data[0]["id"]
 
-    # find ring
+    # 2) Verify job exists + belongs to org
+    job_res = (
+        supabase.table("jobs")
+        .select("id, org_id")
+        .eq("id", payload.job_id)
+        .maybe_single()
+        .execute()
+    )
+    if not job_res.data:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    if job_res.data["org_id"] != org_id:
+        raise HTTPException(status_code=403, detail="job_id does not belong to this org")
+
+    # 3) Find ring
     ring_res = (
         supabase.table("rings")
         .select("id")
         .eq("job_id", payload.job_id)
         .eq("ring_label", payload.ring_label)
+        .maybe_single()
         .execute()
     )
     if not ring_res.data:
-        raise HTTPException(status_code=404, detail="ring not found")
-    ring_id = ring_res.data[0]["id"]
+        raise HTTPException(status_code=404, detail="ring not found for job_id + ring_label")
+    ring_id = ring_res.data["id"]
 
-    # find diamond
+    # 4) Find diamond
     dia_res = (
         supabase.table("diamonds")
         .select("id")
         .eq("job_id", payload.job_id)
         .eq("ring_id", ring_id)
         .eq("slot_index", payload.slot_index)
+        .maybe_single()
         .execute()
     )
     if not dia_res.data:
-        raise HTTPException(status_code=404, detail="diamond not found")
-    diamond_id = dia_res.data[0]["id"]
+        raise HTTPException(status_code=404, detail="diamond not found for job_id + ring_label + slot_index")
+    diamond_id = dia_res.data["id"]
 
-    # update image rows
-    updates = []
-    if payload.uv_free_uploaded:
-        updates.append(("UV_FREE", True))
-    if payload.aset_uploaded:
-        updates.append(("ASET", True))
+    # 5) Derive expected originals paths (canonical)
+    base = f"{payload.org_slug}/{payload.job_id}/{payload.ring_label}/slot_{payload.slot_index}"
+    expected = {
+        "UV_FREE": f"{base}_uv_free.jpg",
+        "ASET": f"{base}_aset.jpg",
+    }
 
-    for image_type, ready in updates:
-        supabase.table("diamond_images").update(
-            {"original_ready": ready, "original_uploaded_at": now_utc_iso()}
-        ).eq("diamond_id", diamond_id).eq("image_type", image_type).execute()
+    # 6) Verify the objects exist in the ORIGINALS bucket
+    missing: list[str] = []
+    confirmed: list[str] = []
 
-    return {"job_id": payload.job_id, "diamond_id": diamond_id, "message": "originals confirmed"}
+    for t in payload.image_types:
+        path = expected[t]
+        # must belong to org
+        if not path.startswith(payload.org_slug + "/"):
+            raise HTTPException(status_code=403, detail=f"path not in org: {path}")
+        # must belong to job
+        job_prefix = f"{payload.org_slug}/{payload.job_id}/"
+        if not path.startswith(job_prefix):
+            raise HTTPException(status_code=403, detail=f"path not in job: {path}")
+        
+        if storage_object_exists(ORIGINALS_BUCKET, path):
+            confirmed.append(t)
+        else:
+            missing.append(path)
+
+    # If anything missing, do NOT mark DB as ready
+    if missing:
+        # 409 makes sense: “not yet uploaded”
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "originals not found in storage yet", "missing": missing},
+        )
+
+    # 7) Mark DB rows as originals-ready
+    ts = now_utc_iso()
+    for t in confirmed:
+        upd = (
+            supabase.table("diamond_images")
+            .update({"original_ready": True, "original_uploaded_at": ts})
+            .eq("diamond_id", diamond_id)
+            .eq("image_type", t)
+            .execute()
+        )
+
+    return ConfirmOriginalsResponse(
+        job_id=payload.job_id,
+        diamond_id=diamond_id,
+        confirmed=confirmed,
+        missing=[],
+    )
+

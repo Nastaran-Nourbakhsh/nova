@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 
 
 JobStatus = Literal["CREATED", "SCANNING", "PAUSED", "PROCESSING", "DONE", "FAILED"]
@@ -60,7 +60,6 @@ class CreateScanRequest(BaseModel):
 
     device_name: Optional[str] = Field(default=None, examples=["Scanner-1"])
 
-
 class ConfirmOriginalsRequest(BaseModel):
     org_slug: str
     job_id: str
@@ -69,7 +68,14 @@ class ConfirmOriginalsRequest(BaseModel):
     # Which originals are now uploaded
     uv_free_uploaded: bool = True
     aset_uploaded: bool = True
+    # optional: confirm one or both
+    image_types: List[Literal["UV_FREE", "ASET"]] = Field(default_factory=lambda: ["UV_FREE", "ASET"])
 
+class ConfirmOriginalsResponse(BaseModel):
+    job_id: str
+    diamond_id: str
+    confirmed: List[str]
+    missing: List[str]
 
 class SignedDownloadRequest(BaseModel):
     org_slug: str

@@ -1,501 +1,457 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-import httpx
+import requests
 from dotenv import load_dotenv
 
 
-# -----------------------------
+# ----------------------------
 # Config
-# -----------------------------
+# ----------------------------
+DEFAULT_API_BASE = "http://127.0.0.1:8000"
+DEFAULT_DB_PATH = "scripts/device_simulator_queue.sqlite3"
+
+
 @dataclass
-class Config:
-    api_base: str
-    device_key: str
-    org_slug: str
-    device_name: str
-    ring_label: str
-
-    # files (local disk) used as the "captured" images
-    preview_uv_file: Path
-    preview_aset_file: Path
-    original_uv_file: Path
-    original_aset_file: Path
-
-    # behavior
-    slots: int
-    delay_between_slots_s: float
-    upload_originals_mode: str  # "immediate" | "delayed" | "never"
-    delayed_originals_after_s: float
-
-    # offline / retry
-    queue_path: Path
-    request_timeout_s: float
-    retry_sleep_s: float
+class SignedUrls:
+    job_id: str
+    # originals
+    uv_free_path: str
+    aset_path: str
+    uv_free_signed_url: str
+    aset_signed_url: str
+    # previews
+    uv_free_preview_path: str
+    aset_preview_path: str
+    uv_free_preview_signed_url: str
+    aset_preview_signed_url: str
 
 
-def _must_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise RuntimeError(f"Missing env var: {name}")
-    return v
-
-
-def _read_bytes(p: Path) -> bytes:
-    if not p.exists():
-        raise FileNotFoundError(f"File not found: {p}")
-    return p.read_bytes()
-
-
-def _now_iso() -> str:
-    # simple readable timestamp
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-# -----------------------------
-# Offline queue
-# -----------------------------
-def load_queue(queue_path: Path) -> List[Dict[str, Any]]:
-    if not queue_path.exists():
-        return []
+# ----------------------------
+# SQLite queue (offline support)
+# ----------------------------
+def q_init(db_path: str) -> None:
+    con = sqlite3.connect(db_path)
     try:
-        return json.loads(queue_path.read_text())
-    except Exception:
-        # if corrupted, keep a backup and start fresh
-        backup = queue_path.with_suffix(".corrupt.json")
-        queue_path.rename(backup)
-        print(f"⚠️ Queue file was corrupted. Moved to {backup}")
-        return []
-
-
-def save_queue(queue_path: Path, items: List[Dict[str, Any]]) -> None:
-    queue_path.parent.mkdir(parents=True, exist_ok=True)
-    queue_path.write_text(json.dumps(items, indent=2))
-
-
-def enqueue(queue_path: Path, item: Dict[str, Any]) -> None:
-    q = load_queue(queue_path)
-    q.append(item)
-    save_queue(queue_path, q)
-
-
-# -----------------------------
-# API helpers
-# -----------------------------
-def api_headers(cfg: Config) -> Dict[str, str]:
-    return {"x-device-key": cfg.device_key}
-
-
-def safe_request(
-    cfg: Config,
-    client: httpx.Client,
-    method: str,
-    path: str,
-    json_body: Optional[Dict[str, Any]] = None,
-) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Returns: (ok, json, error_message)
-    ok=False means "treat as offline / retry later".
-    """
-    url = cfg.api_base.rstrip("/") + path
-    try:
-        resp = client.request(
-            method,
-            url,
-            headers=api_headers(cfg),
-            json=json_body,
-            timeout=cfg.request_timeout_s,
+        con.execute(
+            """
+            create table if not exists queue (
+              id integer primary key autoincrement,
+              created_at integer not null,
+              kind text not null,
+              payload text not null,
+              tries integer not null default 0
+            );
+            """
         )
-    except Exception as e:
-        return False, None, f"network error: {e}"
+        con.commit()
+    finally:
+        con.close()
 
-    # For device simulator: 5xx or 429 or network = retry later
-    if resp.status_code >= 500 or resp.status_code == 429:
-        return False, None, f"server busy: {resp.status_code} {resp.text}"
 
-    # 4xx means "logic error" usually (don’t retry forever)
-    if resp.status_code >= 400:
-        return False, None, f"client error: {resp.status_code} {resp.text}"
-
-    if not resp.text.strip():
-        return True, {}, None
-
+def q_push(db_path: str, kind: str, payload: Dict[str, Any]) -> None:
+    con = sqlite3.connect(db_path)
     try:
-        return True, resp.json(), None
-    except Exception:
-        return True, {"raw": resp.text}, None
+        con.execute(
+            "insert into queue(created_at, kind, payload, tries) values (?, ?, ?, 0)",
+            (int(time.time()), kind, json.dumps(payload)),
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
-def storage_upload_signed_put(signed_url: str, file_path: Path) -> None:
+def q_peek(db_path: str) -> Optional[Tuple[int, str, Dict[str, Any], int]]:
+    con = sqlite3.connect(db_path)
+    try:
+        row = con.execute(
+            "select id, kind, payload, tries from queue order by id asc limit 1"
+        ).fetchone()
+        if not row:
+            return None
+        _id, kind, payload_s, tries = row
+        return _id, kind, json.loads(payload_s), tries
+    finally:
+        con.close()
+
+
+def q_pop(db_path: str, row_id: int) -> None:
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("delete from queue where id = ?", (row_id,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def q_bump_try(db_path: str, row_id: int) -> None:
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("update queue set tries = tries + 1 where id = ?", (row_id,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def q_replace_job_id(db_path: str, old_job_id: str, new_job_id: str) -> int:
     """
-    Upload binary file to signed URL (Supabase signed upload URL endpoint).
-    This uses PUT with image/jpeg.
+    When syncing offline queue, we often create a temp local job_id.
+    After we call /jobs/start online, we need to rewrite queued payloads.
     """
-    data = _read_bytes(file_path)
-    # NOTE: signed upload URLs are on port 54321 and do NOT need x-device-key
-    r = httpx.put(
+    con = sqlite3.connect(db_path)
+    updated = 0
+    try:
+        rows = con.execute("select id, payload from queue").fetchall()
+        for row_id, payload_s in rows:
+            payload = json.loads(payload_s)
+            if payload.get("job_id") == old_job_id:
+                payload["job_id"] = new_job_id
+                con.execute(
+                    "update queue set payload = ? where id = ?",
+                    (json.dumps(payload), row_id),
+                )
+                updated += 1
+        con.commit()
+    finally:
+        con.close()
+    return updated
+
+
+# ----------------------------
+# HTTP helpers
+# ----------------------------
+def _headers(device_key: str) -> Dict[str, str]:
+    return {"x-device-key": device_key, "Content-Type": "application/json"}
+
+
+def api_post_json(api_base: str, path: str, device_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = api_base.rstrip("/") + path
+    r = requests.post(url, headers=_headers(device_key), json=payload, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"POST {path} failed: {r.status_code} {r.text}")
+    return r.json()
+
+
+def put_file_to_signed_url(signed_url: str, file_path: Path) -> None:
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    data = file_path.read_bytes()
+    r = requests.put(
         signed_url,
+        data=data,
         headers={"Content-Type": "image/jpeg"},
-        content=data,
-        timeout=60.0,
+        timeout=60,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"PUT upload failed: {r.status_code} {r.text}")
 
 
-# -----------------------------
-# Queue item schema
-# -----------------------------
-def qitem_upload_and_ingest(
-    *,
+# ----------------------------
+# API calls
+# ----------------------------
+def jobs_start(api_base: str, device_key: str, org_slug: str, device_name: str) -> str:
+    # POST /jobs/start  {org_slug, device_name}
+    res = api_post_json(api_base, "/jobs/start", device_key, {"org_slug": org_slug, "device_name": device_name})
+    job_id = res.get("job_id") or res.get("id")
+    if not job_id:
+        raise RuntimeError(f"/jobs/start response missing job_id: {res}")
+    return job_id
+
+
+def get_signed_urls(api_base: str, device_key: str, org_slug: str, job_id: str, ring_label: str, slot_index: int) -> SignedUrls:
+    # POST /storage/signed-urls  {org_slug, job_id, ring_label, slot_index}
+    res = api_post_json(
+        api_base,
+        "/storage/signed-urls",
+        device_key,
+        {"org_slug": org_slug, "job_id": job_id, "ring_label": ring_label, "slot_index": slot_index},
+    )
+    return SignedUrls(**res)
+
+
+def ingest_scan(
+    api_base: str,
+    device_key: str,
     org_slug: str,
-    device_name: str,
+    job_id: str,
     ring_label: str,
     slot_index: int,
-    job_id: str,
-    # paths in storage (relative)
-    uv_preview_path: str,
-    aset_preview_path: str,
-    uv_original_path: str,
-    aset_original_path: str,
-    # signed URLs to upload
-    uv_preview_signed_url: str,
-    aset_preview_signed_url: str,
-    uv_original_signed_url: str,
-    aset_original_signed_url: str,
-    # local files
-    local_preview_uv: str,
-    local_preview_aset: str,
-    local_original_uv: str,
-    local_original_aset: str,
+    device_name: str,
 ) -> Dict[str, Any]:
-    return {
-        "type": "UPLOAD_AND_INGEST",
-        "created_at": _now_iso(),
+    # Your newer ingest/scan builds paths server-side from org_slug + job_id + ring_label + slot_index.
+    payload = {
         "org_slug": org_slug,
-        "device_name": device_name,
+        "job_id": job_id,
         "ring_label": ring_label,
         "slot_index": slot_index,
-        "job_id": job_id,
-        "paths": {
-            "uv_preview_path": uv_preview_path,
-            "aset_preview_path": aset_preview_path,
-            "uv_original_path": uv_original_path,
-            "aset_original_path": aset_original_path,
-        },
-        "signed": {
-            "uv_preview_signed_url": uv_preview_signed_url,
-            "aset_preview_signed_url": aset_preview_signed_url,
-            "uv_original_signed_url": uv_original_signed_url,
-            "aset_original_signed_url": aset_original_signed_url,
-        },
-        "local": {
-            "preview_uv": local_preview_uv,
-            "preview_aset": local_preview_aset,
-            "original_uv": local_original_uv,
-            "original_aset": local_original_aset,
-        },
-        "state": {
-            "preview_uploaded": False,
-            "ingested": False,
-            "original_uploaded": False,
-            "originals_confirmed": False,
-        },
+        "device_name": device_name,
     }
+    return api_post_json(api_base, "/ingest/scan", device_key, payload)
 
 
-# -----------------------------
-# Core flow
-# -----------------------------
-def drain_queue(cfg: Config, client: httpx.Client) -> None:
-    q = load_queue(cfg.queue_path)
-    if not q:
-        return
+def confirm_originals(
+    api_base: str,
+    device_key: str,
+    org_slug: str,
+    job_id: str,
+    ring_label: str,
+    slot_index: int,
+) -> Dict[str, Any]:
+    # POST /ingest/confirm-originals  {org_slug, job_id, ring_label, slot_index}
+    return api_post_json(
+        api_base,
+        "/ingest/confirm-originals",
+        device_key,
+        {"org_slug": org_slug, "job_id": job_id, "ring_label": ring_label, "slot_index": slot_index},
+    )
 
-    print(f"🔁 Draining queue: {len(q)} pending item(s)")
-    kept: List[Dict[str, Any]] = []
 
-    for item in q:
-        ok = process_queue_item(cfg, client, item)
-        if not ok:
-            kept.append(item)
-            # stop early if offline to avoid spamming
-            print("⏸️ Still offline or blocked; keeping remaining items for later.")
-            break
+# ----------------------------
+# Main slot flow (online)
+# ----------------------------
+def do_one_slot_online(
+    api_base: str,
+    device_key: str,
+    org_slug: str,
+    job_id: str,
+    ring_label: str,
+    slot_index: int,
+    device_name: str,
+    uv_preview_file: Path,
+    aset_preview_file: Path,
+    uv_original_file: Optional[Path],
+    aset_original_file: Optional[Path],
+    upload_originals_now: bool,
+    queue_db: str,
+) -> None:
+    su = get_signed_urls(api_base, device_key, org_slug, job_id, ring_label, slot_index)
 
-    save_queue(cfg.queue_path, kept)
-    if kept:
-        print(f"📦 Queue remaining: {len(kept)}")
+    # 1) Upload previews first
+    put_file_to_signed_url(su.uv_free_preview_signed_url, uv_preview_file)
+    put_file_to_signed_url(su.aset_preview_signed_url, aset_preview_file)
+
+    # 2) Ingest scan (creates DB rows and sets preview_* columns)
+    ingest_scan(api_base, device_key, org_slug, job_id, ring_label, slot_index, device_name)
+
+    # 3) Originals now OR queue originals for later
+    if upload_originals_now:
+        if not uv_original_file or not aset_original_file:
+            raise RuntimeError("upload_originals_now=true but original files not provided.")
+        put_file_to_signed_url(su.uv_free_signed_url, uv_original_file)
+        put_file_to_signed_url(su.aset_signed_url, aset_original_file)
+        confirm_originals(api_base, device_key, org_slug, job_id, ring_label, slot_index)
     else:
-        print("✅ Queue drained.")
+        # Signed URLs expire. So we queue a task that will re-request signed urls later,
+        # then upload originals + confirm.
+        q_push(
+            queue_db,
+            "upload_originals",
+            {
+                "org_slug": org_slug,
+                "job_id": job_id,
+                "ring_label": ring_label,
+                "slot_index": slot_index,
+                "device_name": device_name,
+                "uv_original_file": str(uv_original_file) if uv_original_file else "",
+                "aset_original_file": str(aset_original_file) if aset_original_file else "",
+            },
+        )
 
 
-def process_queue_item(cfg: Config, client: httpx.Client, item: Dict[str, Any]) -> bool:
-    if item.get("type") != "UPLOAD_AND_INGEST":
-        print("⚠️ Unknown queue item type, skipping:", item.get("type"))
-        return True
+# ----------------------------
+# Sync queue (replay offline)
+# ----------------------------
+def run_sync_queue(api_base: str, device_key: str, db_path: str) -> None:
+    print("=== SYNC QUEUE ===")
+    while True:
+        item = q_peek(db_path)
+        if not item:
+            print("Queue empty ✅")
+            return
 
-    st = item["state"]
-    signed = item["signed"]
-    paths = item["paths"]
-    local = item["local"]
-
-    # 1) upload previews (always first)
-    if not st["preview_uploaded"]:
+        row_id, kind, payload, tries = item
         try:
-            storage_upload_signed_put(signed["uv_preview_signed_url"], Path(local["preview_uv"]))
-            storage_upload_signed_put(signed["aset_preview_signed_url"], Path(local["preview_aset"]))
-            st["preview_uploaded"] = True
-            print(f"✅ Preview uploaded for slot {item['slot_index']}")
+            print(f"-> syncing #{row_id} kind={kind} tries={tries}")
+
+            if kind == "job_start":
+                # Start a real job online, then rewrite queued items that refer to the temp job_id
+                temp_job_id = payload["job_id"]
+                real_job_id = jobs_start(api_base, device_key, payload["org_slug"], payload["device_name"])
+                updated = q_replace_job_id(db_path, temp_job_id, real_job_id)
+                print(f"✅ job started online: {real_job_id}  (rewrote {updated} queued items from {temp_job_id})")
+                q_pop(db_path, row_id)
+
+            elif kind == "slot":
+                # Full slot: previews -> ingest -> maybe originals now
+                do_one_slot_online(
+                    api_base=api_base,
+                    device_key=device_key,
+                    org_slug=payload["org_slug"],
+                    job_id=payload["job_id"],
+                    ring_label=payload["ring_label"],
+                    slot_index=int(payload["slot_index"]),
+                    device_name=payload["device_name"],
+                    uv_preview_file=Path(payload["uv_preview_file"]),
+                    aset_preview_file=Path(payload["aset_preview_file"]),
+                    uv_original_file=Path(payload["uv_original_file"]) if payload.get("uv_original_file") else None,
+                    aset_original_file=Path(payload["aset_original_file"]) if payload.get("aset_original_file") else None,
+                    upload_originals_now=bool(payload.get("upload_originals_now", False)),
+                    queue_db=db_path,
+                )
+                q_pop(db_path, row_id)
+
+            elif kind == "upload_originals":
+                # Originals later: re-request signed urls, upload originals, confirm
+                org_slug = payload["org_slug"]
+                job_id = payload["job_id"]
+                ring_label = payload["ring_label"]
+                slot_index = int(payload["slot_index"])
+
+                uv_file = Path(payload.get("uv_original_file", "")).resolve()
+                aset_file = Path(payload.get("aset_original_file", "")).resolve()
+                if not uv_file.exists() or not aset_file.exists():
+                    raise RuntimeError(f"Original files missing: uv={uv_file} aset={aset_file}")
+
+                su = get_signed_urls(api_base, device_key, org_slug, job_id, ring_label, slot_index)
+                put_file_to_signed_url(su.uv_free_signed_url, uv_file)
+                put_file_to_signed_url(su.aset_signed_url, aset_file)
+                confirm_originals(api_base, device_key, org_slug, job_id, ring_label, slot_index)
+
+                q_pop(db_path, row_id)
+
+            else:
+                raise RuntimeError(f"Unknown queue kind: {kind}")
+
         except Exception as e:
-            print(f"🌐 Preview upload failed (offline?) slot {item['slot_index']}: {e}")
-            return False
-
-    # 2) ingest scan (creates diamond + diamond_images rows)
-    if not st["ingested"]:
-        payload = {
-            "org_slug": item["org_slug"],
-            "job_id": item["job_id"],
-            "ring_label": item["ring_label"],
-            "slot_index": item["slot_index"],
-            # originals paths (relative)
-            "uv_free_path": paths["uv_original_path"],
-            "aset_path": paths["aset_original_path"],
-            # previews paths (relative)
-            "uv_free_preview_path": paths["uv_preview_path"],
-            "aset_preview_path": paths["aset_preview_path"],
-            "device_name": item["device_name"],
-        }
-        ok, data, err = safe_request(cfg, client, "POST", "/ingest/scan", payload)
-        if not ok:
-            print(f"🌐 ingest failed slot {item['slot_index']}: {err}")
-            return False
-        st["ingested"] = True
-        print(f"✅ Ingested slot {item['slot_index']} diamond_id={data.get('diamond_id')}")
-
-    # 3) upload originals (maybe delayed / never)
-    if cfg.upload_originals_mode == "never":
-        # do not try
-        return True
-
-    if not st["original_uploaded"]:
-        try:
-            storage_upload_signed_put(signed["uv_original_signed_url"], Path(local["original_uv"]))
-            storage_upload_signed_put(signed["aset_original_signed_url"], Path(local["original_aset"]))
-            st["original_uploaded"] = True
-            print(f"✅ Originals uploaded for slot {item['slot_index']}")
-        except Exception as e:
-            print(f"🌐 Originals upload failed (offline?) slot {item['slot_index']}: {e}")
-            return False
-
-    # 4) confirm originals (API marks original_ready=true and timestamps)
-    if not st["originals_confirmed"]:
-        payload = {
-            "org_slug": item["org_slug"],
-            "job_id": item["job_id"],
-            "ring_label": item["ring_label"],
-            "slot_index": item["slot_index"],
-            "uv_free_path": paths["uv_original_path"],
-            "aset_path": paths["aset_original_path"],
-        }
-        ok, _data, err = safe_request(cfg, client, "POST", "/ingest/confirm-originals", payload)
-        if not ok:
-            print(f"🌐 confirm-originals failed slot {item['slot_index']}: {err}")
-            return False
-        st["originals_confirmed"] = True
-        print(f"✅ Confirmed originals for slot {item['slot_index']}")
-
-    return True
+            print(f"⚠️ sync failed for #{row_id}: {e}")
+            q_bump_try(db_path, row_id)
+            time.sleep(2.0)  # simple backoff
 
 
+# ----------------------------
+# CLI
+# ----------------------------
 def main():
-    # Load env from nova/.env and nova/api/.env if present
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[1]  # nova/
     load_dotenv(repo_root / ".env")
     load_dotenv(repo_root / "api" / ".env")
 
-    # Default files (you can override via env)
-    default_preview_uv = repo_root / "test_images" / "uv_preview_signed_url.jpg"
-    default_preview_aset = repo_root / "test_images" / "aset_preview_signed_url.jpg"
-    default_original_uv = repo_root / "test_images" / "uv_free_signed_url.jpg"
-    default_original_aset = repo_root / "test_images" / "aset_signed_url.jpg"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--api", default=os.getenv("API_BASE", DEFAULT_API_BASE))
+    parser.add_argument("--device-key", default=os.getenv("DEVICE_API_KEY", ""))
+    parser.add_argument("--org", default=os.getenv("ORG_SLUG", "first-customer"))
+    parser.add_argument("--device", default=os.getenv("DEVICE_NAME", "Scanner-1"))
+    parser.add_argument("--ring", default=os.getenv("RING_LABEL", "A"))
+    parser.add_argument("--slots", type=int, default=int(os.getenv("SLOTS", "3")))
 
-    cfg = Config(
-        api_base=os.getenv("API_BASE", "http://127.0.0.1:8000"),
-        device_key=_must_env("DEVICE_API_KEY"),
-        org_slug=os.getenv("ORG_SLUG", "first-customer"),
-        device_name=os.getenv("DEVICE_NAME", "Scanner-1"),
-        ring_label=os.getenv("RING_LABEL", "A"),
-        preview_uv_file=Path(os.getenv("PREVIEW_UV_FILE", str(default_preview_uv))).resolve(),
-        preview_aset_file=Path(os.getenv("PREVIEW_ASET_FILE", str(default_preview_aset))).resolve(),
-        original_uv_file=Path(os.getenv("ORIGINAL_UV_FILE", str(default_original_uv))).resolve(),
-        original_aset_file=Path(os.getenv("ORIGINAL_ASET_FILE", str(default_original_aset))).resolve(),
-        slots=int(os.getenv("SLOTS", "5")),
-        delay_between_slots_s=float(os.getenv("DELAY_BETWEEN_SLOTS_S", "0.5")),
-        upload_originals_mode=os.getenv("UPLOAD_ORIGINALS_MODE", "delayed"),  # immediate|delayed|never
-        delayed_originals_after_s=float(os.getenv("DELAYED_ORIGINALS_AFTER_S", "5.0")),
-        queue_path=Path(os.getenv("QUEUE_PATH", str(repo_root / "tmp" / "device_queue.json"))).resolve(),
-        request_timeout_s=float(os.getenv("REQUEST_TIMEOUT_S", "10.0")),
-        retry_sleep_s=float(os.getenv("RETRY_SLEEP_S", "2.0")),
-    )
+    parser.add_argument("--job-id", default=os.getenv("JOB_ID", ""))  # optional: reuse job
+    parser.add_argument("--upload-originals-now", action="store_true")
 
-    print("\n=== DEVICE SIMULATOR ===")
-    print("API_BASE:", cfg.api_base)
-    print("ORG:", cfg.org_slug)
-    print("DEVICE:", cfg.device_name)
-    print("RING:", cfg.ring_label)
-    print("SLOTS:", cfg.slots)
-    print("UPLOAD_ORIGINALS_MODE:", cfg.upload_originals_mode)
-    print("QUEUE:", cfg.queue_path)
-    print("FILES:")
-    print("  preview_uv:", cfg.preview_uv_file)
-    print("  preview_aset:", cfg.preview_aset_file)
-    print("  original_uv:", cfg.original_uv_file)
-    print("  original_aset:", cfg.original_aset_file)
-    print()
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--sync", action="store_true")
+    parser.add_argument("--db", default=os.getenv("SIM_DB", DEFAULT_DB_PATH))
 
-    with httpx.Client() as client:
-        # First: try to drain queue from previous offline runs
-        drain_queue(cfg, client)
+    parser.add_argument("--uv-preview", default=str(repo_root / "test_images" / "uv_free_preview_signed_url.jpg"))
+    parser.add_argument("--aset-preview", default=str(repo_root / "test_images" / "aset_preview_signed_url.jpg"))
+    parser.add_argument("--uv-original", default=str(repo_root / "test_images" / "uv_free_signed_url.jpg"))
+    parser.add_argument("--aset-original", default=str(repo_root / "test_images" / "aset_signed_url.jpg"))
 
-        # 1) Create job
-        ok, data, err = safe_request(
-            cfg,
-            client,
-            "POST",
-            "/jobs/start",
-            {"org_slug": cfg.org_slug, "device_name": cfg.device_name},
-        )
-        if not ok:
-            print("❌ Cannot start job (offline?). Queueing a START_JOB is possible,")
-            print("but easiest is: rerun when online.")
-            print("Error:", err)
-            return
+    args = parser.parse_args()
 
-        job_id = data.get("job_id")
+    if not args.device_key:
+        raise SystemExit("DEVICE_API_KEY is missing. Put it in nova/api/.env or pass --device-key.")
+
+    q_init(args.db)
+
+    # Sync mode: replay queued tasks
+    if args.sync:
+        run_sync_queue(args.api, args.device_key, args.db)
+        return
+
+    uv_prev = Path(args.uv_preview).resolve()
+    aset_prev = Path(args.aset_preview).resolve()
+    uv_org = Path(args.uv_original).resolve()
+    aset_org = Path(args.aset_original).resolve()
+
+    # Decide job id
+    job_id = args.job_id.strip()
+
+    if args.offline:
+        # Offline: create a TEMP local job id and queue a job_start that will remap later.
         if not job_id:
-            raise RuntimeError(f"/jobs/start did not return job_id: {data}")
+            job_id = str(uuid.uuid4())
+            q_push(args.db, "job_start", {"org_slug": args.org, "device_name": args.device, "job_id": job_id})
+            print(f"🧾 queued job_start (offline) temp_job_id={job_id}")
+        else:
+            # If user provided a job_id in offline mode, we still need to start it online later.
+            q_push(args.db, "job_start", {"org_slug": args.org, "device_name": args.device, "job_id": job_id})
+            print(f"🧾 queued job_start (offline) temp_job_id={job_id}")
 
-        print("✅ Job started:", job_id)
-        print("Dashboard should show it now.")
-        print()
-
-        # 2) Loop slots: ask signed URLs, upload previews, ingest, queue originals upload/confirm
-        delayed_original_items: List[Dict[str, Any]] = []
-
-        for slot in range(cfg.slots):
-            # Request signed URLs for BOTH buckets (your API should return preview + original signed URLs)
-            ok, su, err = safe_request(
-                cfg,
-                client,
-                "POST",
-                "/storage/signed-urls",
+        # Queue slot actions
+        for slot in range(args.slots):
+            q_push(
+                args.db,
+                "slot",
                 {
-                    "org_slug": cfg.org_slug,
+                    "org_slug": args.org,
                     "job_id": job_id,
-                    "ring_label": cfg.ring_label,
+                    "ring_label": args.ring,
                     "slot_index": slot,
+                    "device_name": args.device,
+                    "uv_preview_file": str(uv_prev),
+                    "aset_preview_file": str(aset_prev),
+                    "uv_original_file": str(uv_org),
+                    "aset_original_file": str(aset_org),
+                    "upload_originals_now": bool(args.upload_originals_now),
                 },
             )
-            if not ok or not su:
-                print(f"🌐 signed-urls failed slot {slot}: {err}")
-                print("➡️ Going offline: nothing to upload/ingest yet; retry later.")
-                break
+            print(f"🧾 queued slot {slot} (offline)")
 
-            # Expect keys from your API response:
-            # uv_free_signed_url, aset_signed_url, uv_free_preview_signed_url, aset_preview_signed_url
-            # and paths: uv_free_path, aset_path, uv_free_preview_path, aset_preview_path
-            item = qitem_upload_and_ingest(
-                org_slug=cfg.org_slug,
-                device_name=cfg.device_name,
-                ring_label=cfg.ring_label,
-                slot_index=slot,
-                job_id=job_id,
-                uv_preview_path=su["uv_free_preview_path"],
-                aset_preview_path=su["aset_preview_path"],
-                uv_original_path=su["uv_free_path"],
-                aset_original_path=su["aset_path"],
-                uv_preview_signed_url=su["uv_free_preview_signed_url"],
-                aset_preview_signed_url=su["aset_preview_signed_url"],
-                uv_original_signed_url=su["uv_free_signed_url"],
-                aset_original_signed_url=su["aset_signed_url"],
-                local_preview_uv=str(cfg.preview_uv_file),
-                local_preview_aset=str(cfg.preview_aset_file),
-                local_original_uv=str(cfg.original_uv_file),
-                local_original_aset=str(cfg.original_aset_file),
-            )
+        print("\nOFFLINE DONE ✅")
+        print(f"Queue DB: {args.db}")
+        print("When back online, run:  python scripts/device_simulator.py --sync")
+        return
 
-            # For immediate mode: process fully now (preview+ingest+original+confirm)
-            if cfg.upload_originals_mode == "immediate":
-                ok_item = process_queue_item(cfg, client, item)
-                if not ok_item:
-                    print("🌐 Failed mid-slot; queueing item for later.")
-                    enqueue(cfg.queue_path, item)
-                    break
+    # Online mode: start job if not provided
+    if not job_id:
+        job_id = jobs_start(args.api, args.device_key, args.org, args.device)
+        print("✅ job_id:", job_id)
 
-            # For delayed mode: process preview+ingest now, postpone originals+confirm
-            elif cfg.upload_originals_mode == "delayed":
-                # do preview+ingest now by temporarily setting mode to never for this pass
-                prev_mode = cfg.upload_originals_mode
-                cfg.upload_originals_mode = "never"
-                ok_item = process_queue_item(cfg, client, item)
-                cfg.upload_originals_mode = prev_mode
+    # Execute slots online
+    for slot in range(args.slots):
+        do_one_slot_online(
+            api_base=args.api,
+            device_key=args.device_key,
+            org_slug=args.org,
+            job_id=job_id,
+            ring_label=args.ring,
+            slot_index=slot,
+            device_name=args.device,
+            uv_preview_file=uv_prev,
+            aset_preview_file=aset_prev,
+            uv_original_file=uv_org,
+            aset_original_file=aset_org,
+            upload_originals_now=bool(args.upload_originals_now),
+            queue_db=args.db,
+        )
+        print(f"✅ done slot {slot}")
+        time.sleep(0.8)
 
-                if not ok_item:
-                    print("🌐 Failed mid-slot; queueing item for later.")
-                    enqueue(cfg.queue_path, item)
-                    break
-
-                delayed_original_items.append(item)
-
-            # Never mode: preview+ingest only
-            else:
-                prev_mode = cfg.upload_originals_mode
-                cfg.upload_originals_mode = "never"
-                ok_item = process_queue_item(cfg, client, item)
-                cfg.upload_originals_mode = prev_mode
-
-                if not ok_item:
-                    print("🌐 Failed mid-slot; queueing item for later.")
-                    enqueue(cfg.queue_path, item)
-                    break
-
-            time.sleep(cfg.delay_between_slots_s)
-
-        # 3) In delayed mode, upload originals later + confirm
-        if cfg.upload_originals_mode == "delayed" and delayed_original_items:
-            print()
-            print(f"⏳ Waiting {cfg.delayed_originals_after_s}s before uploading originals…")
-            time.sleep(cfg.delayed_originals_after_s)
-
-            # Now process each delayed item fully (original+confirm). If fails: queue it.
-            for item in delayed_original_items:
-                ok_item = process_queue_item(cfg, client, item)
-                if not ok_item:
-                    print("🌐 Failed uploading originals; queueing for later.")
-                    enqueue(cfg.queue_path, item)
-                    break
-
-        # 4) Stop job (optional)
-        ok, _data, err = safe_request(cfg, client, "POST", f"/jobs/{job_id}/stop", {"org_slug": cfg.org_slug})
-        if not ok:
-            print("⚠️ Could not stop job (not fatal):", err)
-        else:
-            print()
-            print("✅ Job stopped:", job_id)
-
-        print()
-        print("DONE ✅")
-        print("Dashboard: http://localhost:3000/dashboard")
-        print(f"Job page: http://localhost:3000/jobs/{job_id}")
-        print(f"Queue file: {cfg.queue_path}  (should be empty if everything online)")
+    print("\nDONE ✅")
+    print("Dashboard: http://localhost:3000/dashboard")
+    print(f"Job: http://localhost:3000/jobs/{job_id}")
+    if not args.upload_originals_now:
+        print(f"Originals were queued for later. Run: python scripts/device_simulator.py --sync")
 
 
 if __name__ == "__main__":
