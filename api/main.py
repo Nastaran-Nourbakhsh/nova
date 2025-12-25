@@ -1,53 +1,53 @@
+from __future__ import annotations
+
 import os
-import uuid
 from pathlib import Path
-from datetime import datetime, timezone
+from typing import Optional, Tuple, List, Dict, Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header, Depends
 from supabase import create_client, Client
 
-import requests
-
 from schemas import (
-    JobStartRequest,
-    JobStartResponse,
-    JobControlResponse,
+    StartJobRequest,
+    StartJobResponse,
+    JobActionResponse,
     SignedUploadRequest,
     SignedUploadResponse,
+    SignedDownloadRequest,
+    SignedDownloadResponse,
     CreateScanRequest,
     ConfirmOriginalsRequest,
     ConfirmOriginalsResponse,
-    SignedDownloadRequest,
 )
 
+# ----------------------------
+# Env
+# ----------------------------
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
-# ----------------------------
-# Simple device auth (v0)
-# ----------------------------
 DEVICE_API_KEY = os.environ.get("DEVICE_API_KEY")
 if not DEVICE_API_KEY:
     raise RuntimeError("DEVICE_API_KEY is not set")
+
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
+# Fix: storage3 warns if URL lacks trailing slash
+if not SUPABASE_URL.endswith("/"):
+    SUPABASE_URL = SUPABASE_URL + "/"
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+ORIGINALS_BUCKET = "diamond-images"
+PREVIEWS_BUCKET = "diamond-previews"
+
+app = FastAPI(title="Nova API")
 
 
 def require_device_key(x_device_key: str = Header(default="")):
     if x_device_key != DEVICE_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid device key")
-
-
-# ----------------------------
-# Supabase client (service role)
-# ----------------------------
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
-# Buckets
-ORIGINALS_BUCKET = "diamond-images"
-PREVIEWS_BUCKET = "diamond-previews"
-
-app = FastAPI(title="Nova API")
 
 
 @app.get("/health")
@@ -58,59 +58,16 @@ def health():
 # ----------------------------
 # Helpers
 # ----------------------------
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def storage_object_exists(bucket: str, path: str) -> bool:
-    """
-    Check if an object exists in Supabase Storage using HTTP HEAD.
-    Works with service role key (bypasses RLS/policies).
-    """
-    base = SUPABASE_URL.rstrip("/")  # remove trailing slash if any
-    url = f"{base}/storage/v1/object/{bucket}/{path}"
-
-    headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-    }
-
-    r = requests.head(url, headers=headers, timeout=10)
-    if r.status_code == 200:
-        return True
-    if r.status_code == 404:
-        return False
-
-    # other errors are real problems (permissions, bad url, etc.)
-    raise HTTPException(
-        status_code=502,
-        detail=f"Storage HEAD unexpected status={r.status_code} bucket={bucket} path={path} body={r.text}",
-    )
-
-
-def object_exists_in_storage(bucket: str, object_name: str) -> bool:
-    """
-    Verifies existence by querying Postgres: storage.objects
-    This is reliable and does NOT require downloading the file.
-    """
-    res = (
-        supabase.schema("storage")
-        .table("objects")
-        .select("id")
-        .eq("bucket_id", bucket)
-        .eq("name", object_name)
-        .limit(1)
-        .execute()
-    )
-    return bool(res.data)
-
-def get_org_id_by_slug(org_slug: str) -> str:
+def get_org_id(org_slug: str) -> str:
     org_res = supabase.table("orgs").select("id").eq("slug", org_slug).execute()
     if not org_res.data:
         raise HTTPException(status_code=404, detail=f"org_slug '{org_slug}' not found")
     return org_res.data[0]["id"]
 
 
-def get_or_create_device(org_id: str, device_name: str) -> str:
+def get_or_create_device(org_id: str, device_name: Optional[str]) -> Optional[str]:
+    if not device_name:
+        return None
     dev_res = (
         supabase.table("devices")
         .select("id")
@@ -120,12 +77,11 @@ def get_or_create_device(org_id: str, device_name: str) -> str:
     )
     if dev_res.data:
         return dev_res.data[0]["id"]
+    ins = supabase.table("devices").insert({"org_id": org_id, "name": device_name}).execute()
+    return ins.data[0]["id"]
 
-    ins_dev = supabase.table("devices").insert({"org_id": org_id, "name": device_name}).execute()
-    return ins_dev.data[0]["id"]
 
-
-def ensure_job_exists(job_id: str, org_id: str) -> dict:
+def ensure_job_exists(job_id: str, org_id: str) -> Dict[str, Any]:
     # maybe_single() can be flaky across versions; use select + check list
     res = supabase.table("jobs").select("id, org_id, status").eq("id", job_id).execute()
     if not res.data:
@@ -134,7 +90,6 @@ def ensure_job_exists(job_id: str, org_id: str) -> dict:
     if job["org_id"] != org_id:
         raise HTTPException(status_code=403, detail="job_id does not belong to this org")
     return job
-
 
 def get_or_create_ring(job_id: str, ring_label: str) -> str:
     ring_res = (
@@ -151,15 +106,148 @@ def get_or_create_ring(job_id: str, ring_label: str) -> str:
     return ring_ins.data[0]["id"]
 
 
+def object_exists_in_storage(bucket: str, storage_path: str) -> bool:
+    """
+    storage_path is bucket-relative, e.g.:
+      first-customer/<jobId>/A/slot_0_uv_free.jpg
+
+    We check existence via Storage list() in the parent folder,
+    using server-side search to avoid list() pagination limits.
+    """
+    storage_path = storage_path.lstrip("/")
+    if "/" in storage_path:
+        parent, name = storage_path.rsplit("/", 1)
+    else:
+        parent, name = "", storage_path
+
+    # IMPORTANT: storage3 python expects options dict, not a 'search=' kwarg.
+    res = supabase.storage.from_(bucket).list(
+        parent,
+        options={"limit": 100, "offset": 0, "search": name},
+    )
+
+    # res is list[dict] like {"name": "..."}
+    return any(obj.get("name") == name for obj in (res or []))
+
+
+    # # list() returns objects in a folder; use search if supported by your storage3 version
+    # try:
+    #     res = supabase.storage.from_(bucket).list(path=parent)
+    # except Exception:
+    #     # Some versions require path="" instead of None
+    #     res = supabase.storage.from_(bucket).list(path=parent or "")
+    #
+    # if not isinstance(res, list):
+    #     return False
+    #
+    # for obj in res:
+    #     if obj.get("name") == name:
+    #         return True
+    # return False
+
+
+def canonical_paths(org_slug: str, job_id: str, ring_label: str, slot_index: int) -> Dict[str, str]:
+    base = f"{org_slug}/{job_id}/{ring_label}/slot_{slot_index}"
+    return {
+        "uv_free_path": f"{base}_uv_free.jpg",
+        "aset_path": f"{base}_aset.jpg",
+        "uv_free_preview_path": f"{base}_uv_free_thumb.jpg",
+        "aset_preview_path": f"{base}_aset_thumb.jpg",
+    }
+
+
 # ----------------------------
-# Signed download (debug / UI)
+# Jobs lifecycle
 # ----------------------------
-@app.post("/storage/signed-download")
+@app.post("/jobs/start", response_model=StartJobResponse, dependencies=[Depends(require_device_key)])
+def jobs_start(payload: StartJobRequest):
+    org_id = get_org_id(payload.org_slug)
+    device_id = get_or_create_device(org_id, payload.device_name)
+
+    ins = supabase.table("jobs").insert(
+        {"org_id": org_id, "device_id": device_id, "status": "SCANNING"}
+    ).execute()
+    job_id = ins.data[0]["id"]
+    return StartJobResponse(job_id=job_id)
+
+
+@app.post("/jobs/{job_id}/pause", response_model=JobActionResponse, dependencies=[Depends(require_device_key)])
+def jobs_pause(job_id: str):
+    upd = supabase.table("jobs").update({"status": "PAUSED"}).eq("id", job_id).execute()
+    if not upd.data:
+        raise HTTPException(status_code=404, detail="job not found")
+    return JobActionResponse(job_id=job_id, status=upd.data[0]["status"])
+
+
+@app.post("/jobs/{job_id}/resume", response_model=JobActionResponse, dependencies=[Depends(require_device_key)])
+def jobs_resume(job_id: str):
+    upd = supabase.table("jobs").update({"status": "SCANNING"}).eq("id", job_id).execute()
+    if not upd.data:
+        raise HTTPException(status_code=404, detail="job not found")
+    return JobActionResponse(job_id=job_id, status=upd.data[0]["status"])
+
+
+@app.post("/jobs/{job_id}/stop", response_model=JobActionResponse, dependencies=[Depends(require_device_key)])
+def jobs_stop(job_id: str):
+    upd = supabase.table("jobs").update({"status": "STOPPED"}).eq("id", job_id).execute()
+    if not upd.data:
+        raise HTTPException(status_code=404, detail="job not found")
+    return JobActionResponse(job_id=job_id, status=upd.data[0]["status"])
+
+
+# ----------------------------
+# Signed upload/download URLs
+# ----------------------------
+@app.post("/storage/signed-urls", response_model=SignedUploadResponse, dependencies=[Depends(require_device_key)])
+def create_signed_urls(payload: SignedUploadRequest):
+    org_id = get_org_id(payload.org_slug)
+    ensure_job_exists(payload.job_id, org_id)
+
+    p = canonical_paths(payload.org_slug, payload.job_id, payload.ring_label, payload.slot_index)
+
+    mode = payload.mode
+    out = SignedUploadResponse(job_id=payload.job_id)
+
+    # originals
+    if mode in ("both", "originals"):
+        out.uv_free_path = p["uv_free_path"]
+        out.aset_path = p["aset_path"]
+
+        uv = supabase.storage.from_(ORIGINALS_BUCKET).create_signed_upload_url(out.uv_free_path)
+        aset = supabase.storage.from_(ORIGINALS_BUCKET).create_signed_upload_url(out.aset_path)
+
+        out.uv_free_signed_url = uv.get("signedUrl") or uv.get("signed_url")
+        out.aset_signed_url = aset.get("signedUrl") or aset.get("signed_url")
+        if not out.uv_free_signed_url or not out.aset_signed_url:
+            raise HTTPException(status_code=500, detail=f"Unexpected originals signed upload response: uv={uv} aset={aset}")
+
+    # previews
+    if mode in ("both", "previews"):
+        out.uv_free_preview_path = p["uv_free_preview_path"]
+        out.aset_preview_path = p["aset_preview_path"]
+
+        # NOTE: this is what used to break your --sync when previews already existed
+        uvp = supabase.storage.from_(PREVIEWS_BUCKET).create_signed_upload_url(out.uv_free_preview_path)
+        asetp = supabase.storage.from_(PREVIEWS_BUCKET).create_signed_upload_url(out.aset_preview_path)
+
+        out.uv_free_preview_signed_url = uvp.get("signedUrl") or uvp.get("signed_url")
+        out.aset_preview_signed_url = asetp.get("signedUrl") or asetp.get("signed_url")
+        if not out.uv_free_preview_signed_url or not out.aset_preview_signed_url:
+            raise HTTPException(status_code=500, detail=f"Unexpected previews signed upload response: uvp={uvp} asetp={asetp}")
+
+    return out
+
+
+@app.post("/storage/signed-download", response_model=SignedDownloadResponse)
 def signed_download(payload: SignedDownloadRequest):
     bucket = payload.bucket
     path = payload.storage_path
 
-    # Security check: path must belong to org
+    # normalize: allow "bucket/path"
+    prefix = f"{bucket}/"
+    if path.startswith(prefix):
+        path = path[len(prefix):]
+
     if not path.startswith(payload.org_slug + "/"):
         raise HTTPException(status_code=403, detail="storage_path does not belong to org")
 
@@ -167,151 +255,28 @@ def signed_download(payload: SignedDownloadRequest):
     url = res.get("signedURL") or res.get("signedUrl") or res.get("signed_url")
     if not url:
         raise HTTPException(status_code=500, detail=f"Unexpected signed url response: {res}")
-    return {"signed_url": url}
+    return SignedDownloadResponse(signed_url=url)
 
 
 # ----------------------------
-# Job lifecycle
-# ----------------------------
-@app.post("/jobs/start", response_model=JobStartResponse, dependencies=[Depends(require_device_key)])
-def jobs_start(payload: JobStartRequest):
-    org_id = get_org_id_by_slug(payload.org_slug)
-
-    device_id = None
-    if payload.device_name:
-        device_id = get_or_create_device(org_id, payload.device_name)
-
-    job_id = str(uuid.uuid4())
-
-    ins = (
-        supabase.table("jobs")
-        .insert(
-            {
-                "id": job_id,
-                "org_id": org_id,
-                "device_id": device_id,
-                "external_ref": payload.external_ref,
-                "status": "SCANNING",
-                "started_at": now_utc_iso(),
-            }
-        )
-        .execute()
-    )
-    _ = ins.data[0]
-    return JobStartResponse(job_id=job_id, status="SCANNING")
-
-
-@app.post("/jobs/{job_id}/pause", response_model=JobControlResponse, dependencies=[Depends(require_device_key)])
-def jobs_pause(job_id: str, org_slug: str):
-    org_id = get_org_id_by_slug(org_slug)
-    _ = ensure_job_exists(job_id, org_id)
-
-    upd = (
-        supabase.table("jobs")
-        .update({"status": "PAUSED", "paused_at": now_utc_iso()})
-        .eq("id", job_id)
-        .execute()
-    )
-    return JobControlResponse(job_id=job_id, status=upd.data[0]["status"])
-
-
-@app.post("/jobs/{job_id}/resume", response_model=JobControlResponse, dependencies=[Depends(require_device_key)])
-def jobs_resume(job_id: str, org_slug: str):
-    org_id = get_org_id_by_slug(org_slug)
-    _ = ensure_job_exists(job_id, org_id)
-
-    upd = (
-        supabase.table("jobs")
-        .update({"status": "SCANNING", "paused_at": None})
-        .eq("id", job_id)
-        .execute()
-    )
-    return JobControlResponse(job_id=job_id, status=upd.data[0]["status"])
-
-
-@app.post("/jobs/{job_id}/stop", response_model=JobControlResponse, dependencies=[Depends(require_device_key)])
-def jobs_stop(job_id: str, org_slug: str):
-    org_id = get_org_id_by_slug(org_slug)
-    _ = ensure_job_exists(job_id, org_id)
-
-    upd = (
-        supabase.table("jobs")
-        .update({"status": "PROCESSING", "ended_at": now_utc_iso()})
-        .eq("id", job_id)
-        .execute()
-    )
-    return JobControlResponse(job_id=job_id, status=upd.data[0]["status"])
-
-
-# ----------------------------
-# Signed upload URLs (requires existing job_id)
-# ----------------------------
-@app.post("/storage/signed-urls", response_model=SignedUploadResponse, dependencies=[Depends(require_device_key)])
-def create_signed_urls(payload: SignedUploadRequest):
-    org_id = get_org_id_by_slug(payload.org_slug)
-    _job = ensure_job_exists(payload.job_id, org_id)
-
-    job_id = payload.job_id
-
-    # Originals
-    uv_free_path = f"{payload.org_slug}/{job_id}/{payload.ring_label}/slot_{payload.slot_index}_uv_free.jpg"
-    aset_path = f"{payload.org_slug}/{job_id}/{payload.ring_label}/slot_{payload.slot_index}_aset.jpg"
-
-    # Previews
-    uv_free_preview_path = f"{payload.org_slug}/{job_id}/{payload.ring_label}/slot_{payload.slot_index}_uv_free_thumb.jpg"
-    aset_preview_path = f"{payload.org_slug}/{job_id}/{payload.ring_label}/slot_{payload.slot_index}_aset_thumb.jpg"
-
-    uv = supabase.storage.from_(ORIGINALS_BUCKET).create_signed_upload_url(uv_free_path)
-    aset = supabase.storage.from_(ORIGINALS_BUCKET).create_signed_upload_url(aset_path)
-    uv_p = supabase.storage.from_(PREVIEWS_BUCKET).create_signed_upload_url(uv_free_preview_path)
-    aset_p = supabase.storage.from_(PREVIEWS_BUCKET).create_signed_upload_url(aset_preview_path)
-
-    uv_url = uv.get("signedUrl") or uv.get("signed_url")
-    aset_url = aset.get("signedUrl") or aset.get("signed_url")
-    uv_p_url = uv_p.get("signedUrl") or uv_p.get("signed_url")
-    aset_p_url = aset_p.get("signedUrl") or aset_p.get("signed_url")
-
-    if not uv_url or not aset_url or not uv_p_url or not aset_p_url:
-        raise HTTPException(status_code=500, detail=f"Unexpected signed upload response")
-
-    return SignedUploadResponse(
-        job_id=job_id,
-        uv_free_path=uv_free_path,
-        aset_path=aset_path,
-        uv_free_signed_url=uv_url,
-        aset_signed_url=aset_url,
-        uv_free_preview_path=uv_free_preview_path,
-        aset_preview_path=aset_preview_path,
-        uv_free_preview_signed_url=uv_p_url,
-        aset_preview_signed_url=aset_p_url,
-    )
-
-
-# ----------------------------
-# Ingest scan (requires existing job_id; stores previews now)
+# Ingest scan
 # ----------------------------
 @app.post("/ingest/scan", dependencies=[Depends(require_device_key)])
 def ingest_scan(payload: CreateScanRequest):
-    org_id = get_org_id_by_slug(payload.org_slug)
+    org_id = get_org_id(payload.org_slug)
+    device_id = get_or_create_device(org_id, payload.device_name)
+
+    # job must already exist (created by /jobs/start)
     job = ensure_job_exists(payload.job_id, org_id)
+    job_id = job["id"]
 
-    if job["status"] not in ("SCANNING", "PAUSED"):
-        raise HTTPException(status_code=409, detail=f"job status is {job['status']}, cannot ingest")
+    ring_id = get_or_create_ring(job_id, payload.ring_label)
 
-    # ring
-    ring_id = get_or_create_ring(payload.job_id, payload.ring_label)
-
-    base = f"{payload.org_slug}/{payload.job_id}/{payload.ring_label}/slot_{payload.slot_index}"
-    uv_free_path = base + "_uv_free.jpg"
-    aset_path = base + "_aset.jpg"
-    uv_free_preview_path = base + "_uv_free_thumb.jpg"
-    aset_preview_path = base + "_aset_thumb.jpg"
-
-    # diamond idempotency
+    # idempotency: one diamond per (job, ring, slot)
     existing = (
         supabase.table("diamonds")
         .select("id")
-        .eq("job_id", payload.job_id)
+        .eq("job_id", job_id)
         .eq("ring_id", ring_id)
         .eq("slot_index", payload.slot_index)
         .execute()
@@ -321,65 +286,49 @@ def ingest_scan(payload: CreateScanRequest):
 
     dia_ins = (
         supabase.table("diamonds")
-        .insert({"job_id": payload.job_id, "ring_id": ring_id, "slot_index": payload.slot_index})
+        .insert({"job_id": job_id, "ring_id": ring_id, "slot_index": payload.slot_index})
         .execute()
     )
     diamond_id = dia_ins.data[0]["id"]
 
-    # image rows (previews are ready immediately)
     rows = [
         {
             "diamond_id": diamond_id,
             "image_type": "UV_FREE",
-            "storage_path": uv_free_path,
-            "preview_storage_path": uv_free_preview_path,
-            "preview_ready": True,
+            "storage_path": payload.uv_free_path,
+            "preview_storage_path": payload.uv_free_preview_path,
+            "preview_ready": bool(payload.uv_free_preview_path),
             "original_ready": False,
         },
         {
             "diamond_id": diamond_id,
             "image_type": "ASET",
-            "storage_path": aset_path,
-            "preview_storage_path": aset_preview_path,
-            "preview_ready": True,
+            "storage_path": payload.aset_path,
+            "preview_storage_path": payload.aset_preview_path,
+            "preview_ready": bool(payload.aset_preview_path),
             "original_ready": False,
         },
     ]
+
     supabase.table("diamond_images").insert(rows).execute()
 
-    return {"job_id": payload.job_id, "ring_id": ring_id, "diamond_id": diamond_id, "message": "scan ingested"}
+    return {
+        "job_id": job_id,
+        "ring_id": ring_id,
+        "diamond_id": diamond_id,
+        "message": "scan ingested",
+    }
 
 
 # ----------------------------
-# Confirm originals uploaded later
+# Confirm originals (server verifies storage)
 # ----------------------------
-@app.post(
-    "/ingest/confirm-originals",
-    response_model=ConfirmOriginalsResponse,
-    dependencies=[Depends(require_device_key)],
-)
+@app.post("/ingest/confirm-originals", response_model=ConfirmOriginalsResponse, dependencies=[Depends(require_device_key)])
 def confirm_originals(payload: ConfirmOriginalsRequest):
-    # 1) Find org
-    org_res = supabase.table("orgs").select("id").eq("slug", payload.org_slug).execute()
-    if not org_res.data:
-        raise HTTPException(status_code=404, detail=f"org_slug '{payload.org_slug}' not found")
-    org_id = org_res.data[0]["id"]
+    org_id = get_org_id(payload.org_slug)
+    ensure_job_exists(payload.job_id, org_id)
 
-    # 2) Verify job exists + belongs to org
-    job_res = (
-        supabase.table("jobs")
-        .select("id, org_id")
-        .eq("id", payload.job_id)
-        .maybe_single()
-        .execute()
-    )
-    if not job_res.data:
-        raise HTTPException(status_code=404, detail="job_id not found")
-    if job_res.data["org_id"] != org_id:
-        raise HTTPException(status_code=403, detail="job_id does not belong to this org")
-
-    # 3) Find ring
-    ring_res = (
+    ring = (
         supabase.table("rings")
         .select("id")
         .eq("job_id", payload.job_id)
@@ -387,12 +336,11 @@ def confirm_originals(payload: ConfirmOriginalsRequest):
         .maybe_single()
         .execute()
     )
-    if not ring_res.data:
-        raise HTTPException(status_code=404, detail="ring not found for job_id + ring_label")
-    ring_id = ring_res.data["id"]
+    if not ring.data:
+        raise HTTPException(status_code=404, detail="ring not found for job")
+    ring_id = ring.data["id"]
 
-    # 4) Find diamond
-    dia_res = (
+    diamond = (
         supabase.table("diamonds")
         .select("id")
         .eq("job_id", payload.job_id)
@@ -401,59 +349,36 @@ def confirm_originals(payload: ConfirmOriginalsRequest):
         .maybe_single()
         .execute()
     )
-    if not dia_res.data:
-        raise HTTPException(status_code=404, detail="diamond not found for job_id + ring_label + slot_index")
-    diamond_id = dia_res.data["id"]
+    if not diamond.data:
+        raise HTTPException(status_code=404, detail="diamond not found for job/ring/slot")
+    diamond_id = diamond.data["id"]
 
-    # 5) Derive expected originals paths (canonical)
-    base = f"{payload.org_slug}/{payload.job_id}/{payload.ring_label}/slot_{payload.slot_index}"
-    expected = {
-        "UV_FREE": f"{base}_uv_free.jpg",
-        "ASET": f"{base}_aset.jpg",
-    }
+    imgs = (
+        supabase.table("diamond_images")
+        .select("id, image_type, storage_path, original_ready")
+        .eq("diamond_id", diamond_id)
+        .execute()
+    )
+    if not imgs.data:
+        raise HTTPException(status_code=404, detail="diamond_images rows not found")
 
-    # 6) Verify the objects exist in the ORIGINALS bucket
-    missing: list[str] = []
-    confirmed: list[str] = []
+    updated = 0
+    missing: List[str] = []
 
-    for t in payload.image_types:
-        path = expected[t]
-        # must belong to org
-        if not path.startswith(payload.org_slug + "/"):
-            raise HTTPException(status_code=403, detail=f"path not in org: {path}")
-        # must belong to job
-        job_prefix = f"{payload.org_slug}/{payload.job_id}/"
-        if not path.startswith(job_prefix):
-            raise HTTPException(status_code=403, detail=f"path not in job: {path}")
-        
-        if storage_object_exists(ORIGINALS_BUCKET, path):
-            confirmed.append(t)
+    for img in imgs.data:
+        if img.get("original_ready"):
+            continue
+
+        path = img["storage_path"]
+        if object_exists_in_storage(ORIGINALS_BUCKET, path):
+            supabase.table("diamond_images").update(
+                {"original_ready": True, "original_uploaded_at": "now()"}
+            ).eq("id", img["id"]).execute()
+            updated += 1
         else:
             missing.append(path)
 
-    # If anything missing, do NOT mark DB as ready
-    if missing:
-        # 409 makes sense: “not yet uploaded”
-        raise HTTPException(
-            status_code=409,
-            detail={"message": "originals not found in storage yet", "missing": missing},
-        )
+    # NOTE: "now()" is not always treated as SQL; if you want strict timestamps,
+    # add a DB trigger to set original_uploaded_at when original_ready flips true.
 
-    # 7) Mark DB rows as originals-ready
-    ts = now_utc_iso()
-    for t in confirmed:
-        upd = (
-            supabase.table("diamond_images")
-            .update({"original_ready": True, "original_uploaded_at": ts})
-            .eq("diamond_id", diamond_id)
-            .eq("image_type", t)
-            .execute()
-        )
-
-    return ConfirmOriginalsResponse(
-        job_id=payload.job_id,
-        diamond_id=diamond_id,
-        confirmed=confirmed,
-        missing=[],
-    )
-
+    return ConfirmOriginalsResponse(ok=True, updated_rows=updated, missing_paths=missing)

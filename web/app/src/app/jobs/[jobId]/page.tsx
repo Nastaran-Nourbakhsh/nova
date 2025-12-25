@@ -420,6 +420,7 @@ export default function JobDetailPage() {
 
                                       <td className="px-3 py-2 font-mono text-xs">
                                         {d.id}
+                                        <div className="text-[11px] text-gray-500">
                                         {originalsComplete ? (
                                           <span className="ml-2 text-[11px] rounded-full border px-2 py-0.5 text-green-700">
                                             Originals uploaded
@@ -429,6 +430,8 @@ export default function JobDetailPage() {
                                             Originals pending
                                           </span>
                                         )}
+                                        </div>
+
                                         <div className="text-[11px] text-gray-500">
                                           captured:{" "}
                                           {d.captured_at
